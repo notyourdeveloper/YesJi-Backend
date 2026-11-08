@@ -1,69 +1,55 @@
-const express = require("express");
-const admin = require("firebase-admin");
-const app = express();
-
-// Securely load credentials from Render's Environment Variables
-admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId: "yesji-fbd31",
-    clientEmail: process.env.CLIENT_EMAIL,
-    privateKey: process.env.PRIVATE_KEY.replace(/\\n/g, '\n')
-  }),
-  databaseURL: "https://yesji-fbd31-default-rtdb.asia-southeast1.firebasedatabase.app"
-});
-
-const db = admin.database();
-
-// Listen for all chat rooms
-db.ref("/chats").on("child_added", (roomSnapshot) => {
-    const roomId = roomSnapshot.key;
-    const messagesRef = db.ref(`/chats/${roomId}/messages`);
-    
-    let isInitialLoad = true;
-
-    // Listen for new messages inside this specific room
-    messagesRef.limitToLast(1).on("child_added", async (msgSnapshot) => {
-        if (isInitialLoad) return; 
-
-        const messageData = msgSnapshot.val();
-        const senderId = messageData.senderId; 
-        const text = messageData.text; 
-        const senderName = messageData.senderUsername || "Someone";
+// Run a reminder check every 4 hours (14400000 milliseconds)
+setInterval(async () => {
+    console.log("Running unread messages sweep...");
+    try {
+        const chatsSnap = await db.ref("/chats").once("value");
+        const chats = chatsSnap.val() || {};
         
-        if (!senderId || !text) return;
+        // Keep track of unread counts per user
+        const unreadData = {};
 
-        // Figure out the receiver by splitting the Room ID
-        const ids = roomId.split("_");
-        const receiverId = (ids[0] === senderId) ? ids[1] : ids[0];
-        
-        if (!receiverId) return;
+        // Loop through all rooms and messages
+        Object.keys(chats).forEach(roomId => {
+            const messages = chats[roomId].messages || {};
+            
+            Object.values(messages).forEach(msg => {
+                // Find messages that have not been seen
+                if (msg.seen === false && msg.senderId) {
+                    const ids = roomId.split("_");
+                    const receiverId = (ids[0] === msg.senderId) ? ids[1] : ids[0];
+                    
+                    if (receiverId) {
+                        if (!unreadData[receiverId]) {
+                            unreadData[receiverId] = { msgCount: 0, chatRooms: new Set() };
+                        }
+                        unreadData[receiverId].msgCount += 1;
+                        unreadData[receiverId].chatRooms.add(roomId);
+                    }
+                }
+            });
+        });
 
-        try {
-            // Fetch the receiver's push token
-            const userSnap = await db.ref(`/users/${receiverId}/fcmToken`).once('value');
+        // Send out the summary notifications
+        for (const [userId, data] of Object.entries(unreadData)) {
+            const userSnap = await db.ref(`/users/${userId}/fcmToken`).once('value');
             const fcmToken = userSnap.val();
-
+            
             if (fcmToken) {
+                const roomCount = data.chatRooms.size;
+                const chatWord = roomCount === 1 ? "chat" : "chats";
+                const msgWord = data.msgCount === 1 ? "message" : "messages";
+                
                 await admin.messaging().send({
                     notification: { 
-                        title: `New Message from ${senderName}`, 
-                        body: text 
+                        title: "Missed Messages on YesJi", 
+                        body: `You have ${data.msgCount} unread ${msgWord} in ${roomCount} ${chatWord}.` 
                     },
                     token: fcmToken
                 });
-                console.log(`Notification successfully sent to ${receiverId} in room ${roomId}`);
-            } else {
-                console.log(`User ${receiverId} does not have an FCM token saved.`);
+                console.log(`Sent reminder to ${userId}`);
             }
-        } catch (error) { 
-            console.error("Failed to send notification:", error); 
         }
-    });
-
-    // Ignore old messages loaded on boot
-    setTimeout(() => { isInitialLoad = false; }, 5000);
-});
-
-// Required for Render to keep the server alive
-app.get("/", (req, res) => res.send("YesJi Server is Active & Watching Deep Chats"));
-app.listen(process.env.PORT || 3000, () => console.log("Server listening for nested messages..."));
+    } catch (error) {
+        console.error("Reminder Error:", error);
+    }
+}, 14400000); // 4 hours in milliseconds
